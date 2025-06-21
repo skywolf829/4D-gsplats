@@ -1,0 +1,38 @@
+# Bytecode and virtual environments
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+.env/
+
+# PyTorch, UV, and Conda cache
+*.pth
+*.egg-info/
+dist/
+build/
+.cache/
+*.log
+
+# Jupyter/IPython
+.ipynb_checkpoints/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Git and VCS
+.git/
+.gitignore
+.gitattributes
+
+# Editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker-specific
+Dockerfile
+docker-compose.yml
+docker-compose.override.yml
+docker/

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=62", "setuptools_scm[toml]>=6.2", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamic-gsplats"
+version = "0.1.0"
+authors = [
+    {name = "Skylar Wurster", email = "swwurster@gmail.com"},
+]
+description = "Dynamic gaussian splats"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Private :: Internal Use Only"
+]
+
+dependencies = [
+    "numpy",
+    "pandas>=0.2.1",
+    "torch==2.7.1",
+    "vggt @ git+https://github.com/facebookresearch/vggt.git@8e3d2809c1c93fa27298c290605841d7e876b285",
+    "imageio>=2.37.0",
+    "tqdm>=4.67.1",
+    "trimesh>=4.6.12",
+    "gradio>=5.34.2",
+    "opencv-python-headless",
+    "scipy>=1.15.3",
+    "matplotlib>=3.10.3",
+    "onnxruntime>=1.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+]
+
+[tool.uv.sources]
+pytorch = { url = "https://download.pytorch.org/whl/cu128" }
+pypi = { url = "https://pypi.org/simple" }
+
+[tool.setuptools]
+packages = ["dynamic_gsplats"]
+
+[tool.uv]
+managed = true

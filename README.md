@@ -1,1 +1,1 @@
-# 4D-gsplats
+# Dynamic Gsplats
