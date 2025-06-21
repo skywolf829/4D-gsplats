@@ -350,6 +350,7 @@ def run_gsplat_refinement(target_dir):
         # 2. Extract camera params
         extrinsics = np.array(preds["extrinsic"]).astype(np.float32) # (N, 4, 4)
         intrinsics = np.array(preds["intrinsic"]).astype(np.float32) # (N, 3, 3)
+        original_image_shape = np.array(preds["images"]).shape[1:]
         # 3. Load images from target_dir/images (sorted)
         image_dir = Path(target_dir) / "images"
         image_paths = sorted(image_dir.glob("*.png")) + sorted(image_dir.glob("*.jpg"))

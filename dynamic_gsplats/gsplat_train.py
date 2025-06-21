@@ -366,7 +366,7 @@ def create_splats_with_optimizers(
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
     BS = batch_size * world_size
-    optimizer_class = None
+    
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
     elif visible_adam:

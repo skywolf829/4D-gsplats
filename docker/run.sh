@@ -10,4 +10,4 @@ docker run --rm -it \
   -v "$PROJECT_DIR":/dynamic-gsplats \
   -w /dynamic-gsplats \
   "$IMAGE_TAG" \
-  bash
+  bash -c "source .venv/bin/activate && exec bash"
