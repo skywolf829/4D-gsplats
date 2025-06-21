@@ -1,0 +1,29 @@
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=America/Los_Angeles
+ENV MAMBA_VERSION=23.11.0-0
+ENV PATH=/opt/conda/bin:/root/.local/bin:$PATH
+ENV CUDA_ARCHITECTURES=75;80;86;89
+ENV TORCH_CUDA_ARCH_LIST="8.9 8.6 6.0 7.5"
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=$PATH:$CUDA_HOME/bin
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_HOME/lib64
+ENV TORCH_HOME=/tmp/torch_cache
+
+# System packages
+RUN apt-get update && \
+    apt-get install -y curl git build-essential ninja-build && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Mambaforge (Miniconda + Mamba)
+RUN curl -L -o mambaforge.sh https://github.com/conda-forge/miniforge/releases/download/${MAMBA_VERSION}/Mambaforge-Linux-x86_64.sh && \
+    bash mambaforge.sh -b -p /opt/conda && \
+    rm mambaforge.sh
+
+# Python 3.12
+RUN mamba install -y python=3.12 -c conda-forge && \
+    mamba clean -a -y
+
+# Add Conda activation for interactive shell use
+RUN echo ". /opt/conda/etc/profile.d/conda.sh && conda activate base" >> ~/.bashrc

@@ -193,7 +193,7 @@ class Config:
     save_ply: bool = True
 
     # Degree of spherical harmonics
-    sh_degree: int = 1
+    sh_degree: int = 0
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -387,7 +387,7 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(
-        self, local_rank: int, world_rank, world_size: int, cfg: Config
+        self, cfg: Config, local_rank: int = 0, world_rank: int = 0, world_size: int = 1
     ) -> None:
         set_random_seed(42 + local_rank)
 
@@ -876,6 +876,6 @@ def train_gsplat_from_colmap(
     colmap_results_folder: str,
 ):
     config = Config(result_dir=colmap_results_folder)
-    config.adjust_steps(0.2)
-    runner = Runner(0, 0, 1, config)
+    config.adjust_steps(0.05)
+    runner = Runner(config)
     runner.train()
