@@ -28,7 +28,8 @@ WORKDIR /dynamic-gsplats
 COPY . .
 
 # Use uv to install deps + local package (editable)
-RUN uv sync
+RUN uv pip install torch==2.7.1 && \
+    uv sync --no-build-isolation
 
 # Optional: activate base env in bash sessions
 RUN echo ". /opt/conda/etc/profile.d/conda.sh && conda activate base" >> ~/.bashrc

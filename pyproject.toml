@@ -30,6 +30,11 @@ dependencies = [
     "scipy>=1.15.3",
     "matplotlib>=3.10.3",
     "onnxruntime>=1.22.0",
+    "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70",
+    "torchmetrics[image]==1.7.3",
+    "fused-ssim @ git+https://github.com/rahul-goel/fused-ssim.git@8bdb59feb7b9a41b1fab625907cb21f5417deaac",
+    "scikit-learn==1.7.0",
+    "tensorboard==2.19.0",
 ]
 
 [project.optional-dependencies]
