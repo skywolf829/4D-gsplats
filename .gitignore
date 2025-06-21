@@ -195,3 +195,4 @@ cython_debug/
 
 input_images/
 data/
+examples/

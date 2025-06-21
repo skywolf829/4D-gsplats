@@ -27,10 +27,9 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-
 from sklearn.neighbors import NearestNeighbors
-
 from dynamic_gsplats.file_ops import CameraImageDataset
+from dynamic_gsplats.colmap_dataset import Dataset, Parser
 
 def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
     """
@@ -189,7 +188,7 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 1_000
+    max_steps: int = 30000
     # Whether to save ply file (storage size can be large)
     save_ply: bool = True
 
@@ -301,8 +300,7 @@ class Config:
 
 
 def create_splats_with_optimizers(
-    init_points: np.ndarray,
-    init_rgb: np.ndarray,
+    parser: Parser,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
     means_lr: float = 1.6e-4,
@@ -322,8 +320,8 @@ def create_splats_with_optimizers(
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
 
-    points = torch.from_numpy(init_points).float()
-    rgbs = torch.from_numpy(init_rgb / 255.0).float()
+    points = torch.from_numpy(parser.points).float()
+    rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -389,16 +387,7 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(
-        self, 
-        init_points: np.ndarray,
-        init_rgb: np.ndarray,
-        training_images: List[Path],
-        training_extrinsics: np.ndarray,
-        training_intrinsics: np.ndarray,
-        local_rank: int = 0, 
-        world_rank: int = 0, 
-        world_size: int = 1, 
-        cfg: Config = Config()
+        self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
 
@@ -423,18 +412,25 @@ class Runner:
 
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
-        print("Training images:", training_images)
-        print("Training extrinsics:", training_extrinsics)
-        print("Training intrinsics:", training_intrinsics)
-        self.trainset = CameraImageDataset(training_images, training_extrinsics, training_intrinsics)
-        self.scene_scale = 1.1 * cfg.global_scale
+
+        # Load data: Training data should contain initial points and colors.
+        self.parser = Parser(
+            data_dir=cfg.result_dir,
+            normalize=False,
+            test_every=8,
+        )
+        self.trainset = Dataset(
+            self.parser,
+            patch_size=None,
+            load_depths=False,
+        )
+        self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
-            init_points=init_points,
-            init_rgb=init_rgb,
+            self.parser,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
             means_lr=cfg.means_lr,
@@ -467,9 +463,12 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
+        # Compression Strategy
+        self.compression_method = None
+
         self.pose_optimizers = []
         if cfg.pose_opt:
-            self.pose_adjust = CameraOptModule(len(training_extrinsics)).to(self.device)
+            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
             self.pose_adjust.zero_init()
             self.pose_optimizers = [
                 torch.optim.Adam(
@@ -482,7 +481,7 @@ class Runner:
                 self.pose_adjust = DDP(self.pose_adjust)
 
         if cfg.pose_noise > 0.0:
-            self.pose_perturb = CameraOptModule(len(training_extrinsics)).to(self.device)
+            self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
             self.pose_perturb.random_init(cfg.pose_noise)
             if world_size > 1:
                 self.pose_perturb = DDP(self.pose_perturb)
@@ -491,7 +490,7 @@ class Runner:
         if cfg.app_opt:
             assert feature_dim is not None
             self.app_module = AppearanceOptModule(
-                len(training_extrinsics), feature_dim, cfg.app_embed_dim, cfg.sh_degree
+                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
             ).to(self.device)
             # initialize the last layer to be zero so that the initial output is zero.
             torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
@@ -509,6 +508,8 @@ class Runner:
             ]
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
+
+        self.bil_grid_optimizers = []
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -617,7 +618,8 @@ class Runner:
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
-       
+
+
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
@@ -641,6 +643,9 @@ class Runner:
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            num_train_rays_per_step = (
+                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
+            )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
@@ -676,6 +681,7 @@ class Runner:
             else:
                 colors, depths = renders, None
 
+           
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
@@ -713,6 +719,9 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+            if cfg.use_bilateral_grid:
+                tvloss = 10 * total_variation_loss(self.bil_grids.grids)
+                loss += tvloss
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -764,8 +773,7 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
-
-          
+            
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
@@ -802,6 +810,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
@@ -857,5 +868,14 @@ class Runner:
             sh0=sh0,
             shN=shN,
             format="ply",
-            save_to=f"{self.cfg.result_dir}/point_cloud_{step}.ply",
+            save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
         )
+
+
+def train_gsplat_from_colmap(
+    colmap_results_folder: str,
+):
+    config = Config(result_dir=colmap_results_folder)
+    config.adjust_steps(0.2)
+    runner = Runner(0, 0, 1, config)
+    runner.train()

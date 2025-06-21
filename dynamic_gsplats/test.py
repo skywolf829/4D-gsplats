@@ -5,6 +5,7 @@ import numpy as np
 from file_ops import extract_single_frame, load_and_preprocess_images_square
 from scene_init import init_model, model_inference, bundle_adjustment
 from scene_init import DEVICE, DTYPE
+from gsplat_train import train_gsplat_from_colmap
 
 p = Path(__file__).parent.parent / "examples" / "time_varying" / "cut_roasted_beef"
 
@@ -32,6 +33,6 @@ print("Running bundle adjustment...")
 bundle_adjustment(img_paths, original_coords, points_3d, extrinsic, intrinsic, depth_conf, 
     images, img_load_resolution, vggt_fixed_resolution, p)
 
-
+train_gsplat_from_colmap(str(p))
 
 

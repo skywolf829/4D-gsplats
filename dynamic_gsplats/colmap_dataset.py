@@ -7,7 +7,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
-from pycolmap.utils import SceneManager
+from python_colmap import SceneManager
 from tqdm import tqdm
 from typing_extensions import assert_never
 
@@ -330,7 +330,7 @@ class Parser:
             )
             image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
-        image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in colmap_files]
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -488,19 +488,14 @@ class Dataset:
     def __init__(
         self,
         parser: Parser,
-        split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
     ):
         self.parser = parser
-        self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
-        else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+        self.indices = indices
 
     def __len__(self):
         return len(self.indices)
@@ -582,7 +577,7 @@ if __name__ == "__main__":
     parser = Parser(
         data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
     )
-    dataset = Dataset(parser, split="train", load_depths=True)
+    dataset = Dataset(parser, load_depths=True)
     print(f"Dataset: {len(dataset)} images.")
 
     writer = imageio.get_writer("results/points.mp4", fps=30)

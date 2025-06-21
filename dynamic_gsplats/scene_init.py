@@ -54,6 +54,35 @@ def rename_colmap_recons_and_rescale_camera(
 
     return reconstruction
 
+def create_pixel_coordinate_grid(num_frames, height, width):
+    """
+    Creates a grid of pixel coordinates and frame indices for all frames.
+    Returns:
+        tuple: A tuple containing:
+            - points_xyf (numpy.ndarray): Array of shape (num_frames, height, width, 3)
+                                            with x, y coordinates and frame indices
+            - y_coords (numpy.ndarray): Array of y coordinates for all frames
+            - x_coords (numpy.ndarray): Array of x coordinates for all frames
+            - f_coords (numpy.ndarray): Array of frame indices for all frames
+    """
+    # Create coordinate grids for a single frame
+    y_grid, x_grid = np.indices((height, width), dtype=np.float32)
+    x_grid = x_grid[np.newaxis, :, :]
+    y_grid = y_grid[np.newaxis, :, :]
+
+    # Broadcast to all frames
+    x_coords = np.broadcast_to(x_grid, (num_frames, height, width))
+    y_coords = np.broadcast_to(y_grid, (num_frames, height, width))
+
+    # Create frame indices and broadcast
+    f_idx = np.arange(num_frames, dtype=np.float32)[:, np.newaxis, np.newaxis]
+    f_coords = np.broadcast_to(f_idx, (num_frames, height, width))
+
+    # Stack coordinates and frame indices
+    points_xyf = np.stack((x_coords, y_coords, f_coords), axis=-1)
+
+    return points_xyf
+
 def init_model(load_url=_URL, device=DEVICE, dtype=DTYPE):
     model = VGGT()
     model.load_state_dict(torch.hub.load_state_dict_from_url(load_url))
@@ -61,6 +90,28 @@ def init_model(load_url=_URL, device=DEVICE, dtype=DTYPE):
     model.to(device)
     return model
 
+def randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
+    """
+    If mask has more than max_trues True values,
+    randomly keep only max_trues of them and set the rest to False.
+    """
+    # 1D positions of all True entries
+    true_indices = np.flatnonzero(mask)  # shape = (N_true,)
+
+    # if already within budget, return as-is
+    if true_indices.size <= max_trues:
+        return mask
+
+    # randomly pick which True positions to keep
+    sampled_indices = np.random.choice(true_indices, size=max_trues, replace=False)  # shape = (max_trues,)
+
+    # build new flat mask: True only at sampled positions
+    limited_flat_mask = np.zeros(mask.size, dtype=bool)
+    limited_flat_mask[sampled_indices] = True
+
+    # restore original shape
+    return limited_flat_mask.reshape(mask.shape)
+    
 def model_inference(model, images, resolution=518):
     # images: [B, 3, H, W]
 
@@ -89,56 +140,98 @@ def model_inference(model, images, resolution=518):
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
     return extrinsic, intrinsic, depth_map, depth_conf, points_3d
 
-def bundle_adjustment(image_paths, original_coords, points_3d, extrinsic, intrinsic, depth_conf, images, img_load_resolution, vggt_fixed_resolution, save_dir):
-    image_size = np.array(images.shape[-2:])
-    scale = img_load_resolution / vggt_fixed_resolution
-    shared_camera = False
+def bundle_adjustment(image_paths, original_coords, points_3d, extrinsic, intrinsic, 
+    depth_conf, images, img_load_resolution, vggt_fixed_resolution, save_dir, use_ba=False):
 
-    with torch.autocast(device_type=DEVICE, dtype=DTYPE):
-        # Predicting Tracks
-        # Using VGGSfM tracker instead of VGGT tracker for efficiency
-        # VGGT tracker requires multiple backbone runs to query different frames (this is a problem caused by the training process)
-        # Will be fixed in VGGT v2
+    if use_ba:
+        image_size = np.array(images.shape[-2:])
+        scale = img_load_resolution / vggt_fixed_resolution
+        shared_camera = False
 
-        # You can also change the pred_tracks to tracks from any other methods
-        # e.g., from COLMAP, from CoTracker, or by chaining 2D matches from Lightglue/LoFTR.
-        pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
-            images,
-            conf=depth_conf,
-            points_3d=points_3d,
-            masks=None,
-            max_query_pts=512,
+        with torch.autocast(device_type=DEVICE, dtype=DTYPE):
+            # Predicting Tracks
+            # Using VGGSfM tracker instead of VGGT tracker for efficiency
+            # VGGT tracker requires multiple backbone runs to query different frames (this is a problem caused by the training process)
+            # Will be fixed in VGGT v2
+
+            # You can also change the pred_tracks to tracks from any other methods
+            # e.g., from COLMAP, from CoTracker, or by chaining 2D matches from Lightglue/LoFTR.
+            pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
+                images,
+                conf=depth_conf,
+                points_3d=points_3d,
+                masks=None,
+                max_query_pts=512,
+            )
+
+            torch.cuda.empty_cache()
+
+        # rescale the intrinsic matrix from 518 to 1024
+        intrinsic[:, :2, :] *= scale
+        track_mask = pred_vis_scores > 0.1
+
+        # TODO: radial distortion, iterative BA, masks
+        reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
+            points_3d,
+            extrinsic,
+            intrinsic,
+            pred_tracks,
+            image_size,
+            masks=track_mask,
+            max_reproj_error=0.5,
+            shared_camera=shared_camera,
+            camera_type="pinhole",
+            points_rgb=points_rgb,
         )
 
-        torch.cuda.empty_cache()
+        if reconstruction is None:
+            raise ValueError("No reconstruction can be built with BA")
 
-    # rescale the intrinsic matrix from 518 to 1024
-    intrinsic[:, :2, :] *= scale
-    track_mask = pred_vis_scores > 0.1
+        # Bundle Adjustment
+        ba_options = pycolmap.BundleAdjustmentOptions()
+        pycolmap.bundle_adjustment(reconstruction, ba_options)
 
-    # TODO: radial distortion, iterative BA, masks
-    reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
-        points_3d,
-        extrinsic,
-        intrinsic,
-        pred_tracks,
-        image_size,
-        masks=track_mask,
-        max_reproj_error=0.5,
-        shared_camera=shared_camera,
-        camera_type="pinhole",
-        points_rgb=points_rgb,
-    )
+        reconstruction_resolution = img_load_resolution
+    else:
+        conf_thres_value = 0.1
+        max_points_for_colmap = 100000  # randomly sample 3D points
+        shared_camera = False  # in the feedforward manner, we do not support shared camera
+        camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
 
-    if reconstruction is None:
-        raise ValueError("No reconstruction can be built with BA")
+        image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
+        num_frames, height, width, _ = points_3d.shape
 
-    # Bundle Adjustment
-    ba_options = pycolmap.BundleAdjustmentOptions()
-    pycolmap.bundle_adjustment(reconstruction, ba_options)
+        points_rgb = F.interpolate(
+            images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
+        )
+        points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
+        points_rgb = points_rgb.transpose(0, 2, 3, 1)
 
-    reconstruction_resolution = img_load_resolution
-    
+        # (S, H, W, 3), with x, y coordinates and frame indices
+        points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
+
+        conf_mask = depth_conf >= conf_thres_value
+        # at most writing 100000 3d points to colmap reconstruction object
+        conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
+
+        points_3d = points_3d[conf_mask]
+        points_xyf = points_xyf[conf_mask]
+        points_rgb = points_rgb[conf_mask]
+
+        print("Converting to COLMAP format")
+        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
+            points_3d,
+            points_xyf,
+            points_rgb,
+            extrinsic,
+            intrinsic,
+            image_size,
+            shared_camera=shared_camera,
+            camera_type=camera_type,
+        )
+
+        reconstruction_resolution = vggt_fixed_resolution
+
     reconstruction = rename_colmap_recons_and_rescale_camera(
         reconstruction,
         image_paths,

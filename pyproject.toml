@@ -32,11 +32,10 @@ dependencies = [
     "torchmetrics[image]",
     "scikit-learn==1.7.0",
     "tensorboard==2.19.0",
-    "pycolmap==3.11.1",
+    "pycolmap==3.10",
     "lightglue @ git+https://github.com/jytime/LightGlue.git#egg=lightglue",
     "hydra-core",
     "xformers",
-    "pycolmap @ git+https://github.com/rmbrualla/pycolmap@cc7ea4b7301720ac29287dbe450952511b32125e",
 
     "vggt @ git+https://github.com/facebookresearch/vggt.git@8e3d2809c1c93fa27298c290605841d7e876b285",
     "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70",
