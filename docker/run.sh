@@ -9,5 +9,4 @@ docker run --rm -it \
   --gpus all \
   -v "$PROJECT_DIR":/dynamic-gsplats \
   -w /dynamic-gsplats \
-  "$IMAGE_TAG" \
-  bash -c ". .venv/bin/activate && exec bash"
+  "$IMAGE_TAG" 

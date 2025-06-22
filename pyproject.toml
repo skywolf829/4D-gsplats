@@ -38,8 +38,8 @@ dependencies = [
     "xformers",
 
     "vggt @ git+https://github.com/facebookresearch/vggt.git@8e3d2809c1c93fa27298c290605841d7e876b285",
-    "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70",
     "fused-ssim @ git+https://github.com/rahul-goel/fused-ssim.git@8bdb59feb7b9a41b1fab625907cb21f5417deaac",
+    "gsplat==1.5.2",
 ]
 
 [project.optional-dependencies]
