@@ -6,11 +6,14 @@ from file_ops import extract_single_frame, load_and_preprocess_images_square
 from scene_init import init_model, model_inference, bundle_adjustment
 from scene_init import DEVICE, DTYPE
 from gsplat_train import train_gsplat_from_colmap
+import hashlib
 
-p = Path(__file__).parent.parent / "examples" / "time_varying" / "cut_roasted_beef"
+videos_path = Path(__file__).parent.parent / "examples" / "time_varying" / "cut_roasted_beef"
+output_dir = Path(__file__).parent.parent / "output" / hashlib.md5(str(videos_path).encode()).hexdigest()
+output_dir.mkdir(parents=True, exist_ok=True)
 
-videos = sorted(glob.glob(str(p / "*.mp4")))
-img_dir = Path(p / "images")
+videos = sorted(glob.glob(str(videos_path / "*.mp4")))
+img_dir = Path(output_dir / "images")
 img_dir.mkdir(parents=True, exist_ok=True)
 img_paths = []
 for video in videos:
@@ -31,8 +34,8 @@ extrinsic, intrinsic, depth_map, depth_conf, points_3d = model_inference(vggt_mo
 
 print("Running bundle adjustment...")
 bundle_adjustment(img_paths, original_coords, points_3d, extrinsic, intrinsic, depth_conf, 
-    images, img_load_resolution, vggt_fixed_resolution, p)
+    images, img_load_resolution, vggt_fixed_resolution, output_dir)
 
-train_gsplat_from_colmap(str(p))
+train_gsplat_from_colmap(str(output_dir))
 
 
