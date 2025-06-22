@@ -18,9 +18,9 @@ classifiers = [
 ]
 
 dependencies = [
-    "numpy>=1.24,<2.0",
+    "numpy==1.26.3",
     "pandas>=0.2.1",
-    "torch==2.7.0",
+    "torch==2.6.*",
     "imageio>=2.37.0",
     "tqdm",
     "trimesh>=4.6.12",
@@ -50,7 +50,7 @@ dev = [
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu128"
+url = "https://download.pytorch.org/whl/cu124"
 
 [tool.uv.sources]
 torch = { index = "pytorch" }

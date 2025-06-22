@@ -1,31 +1,47 @@
-FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=America/Los_Angeles
 ENV MAMBA_VERSION=23.11.0-0
-ENV PATH=$PATH:/opt/conda/bin:/root/.local/bin
-ENV CUDA_ARCHITECTURES=75;80;86;89
-ENV TORCH_CUDA_ARCH_LIST="8.9 8.6 6.0 7.5"
+
+ENV TORCH_CUDA_ARCH_LIST="8.9 8.6"
 ENV CUDA_HOME=/usr/local/cuda
-ENV PATH=$PATH:$CUDA_HOME/bin
+ENV CC=/usr/bin/gcc-12
+ENV CXX=/usr/bin/g++-12
+
+ENV PATH=/.venv/bin:$CUDA_HOME/bin:$PATH
 ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_HOME/lib64
 ENV TORCH_HOME=/tmp/torch_cache
 
 # System packages
 RUN apt-get update && \
-    apt-get install -y curl git build-essential libglm-dev libnvidia-gl-550 libglew-dev wget && \
-    apt-get install -y ninja-build gcc-12 g++-12 && \
+    apt-get install -y curl git wget build-essential libglm-dev \
+    libnvidia-gl-550 libglew-dev \
+    ninja-build \
+    gcc-12 g++-12 \
+    libgl1-mesa-dev \
+    libegl1-mesa-dev \
+    libxrandr-dev \
+    libxinerama-dev \
+    libxcursor-dev \
+    libxi-dev \
+    libc6 libspqr2 libatlas3-base libgcc-s1 libgl1 libglew2.2 libopenexr-dev libffi-dev \
+    ffmpeg libboost-program-options-dev libboost-filesystem-dev libboost-graph-dev \
+    libboost-system-dev libflann-dev libfreeimage-dev libmetis-dev libgoogle-glog-dev \
+    libgtest-dev libsqlite3-dev libglew-dev libcgal-dev libssl-dev libblas-dev liblapack-dev libsuitesparse-dev libgflags-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+
 # Install uv
 RUN curl -L https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin/:$PATH"
 ENV UV_LINK_MODE=copy
 ENV UV_COMPILE_BYTECODE=1
 ENV UV_PYTHON=python3.12 
-ENV UV_PROJECT_ENVIRONMENT=/dynamic-gsplats
+ENV UV_PROJECT_ENVIRONMENT=/.venv
+RUN uv python install 3.12
 
-WORKDIR /dynamic-gsplats
-RUN uv venv --python 3.12 ./venv
-ENV PATH=/dynamic-gsplats/venv/bin:$PATH
-RUN uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+RUN uv venv .venv
+RUN uv pip install wheel ninja setuptools
+RUN uv pip install numpy==1.26.3 torch==2.6.* --index-url https://download.pytorch.org/whl/cu124
