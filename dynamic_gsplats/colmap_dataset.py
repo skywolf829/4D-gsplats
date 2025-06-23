@@ -9,7 +9,6 @@ import torch
 from PIL import Image
 from python_colmap import SceneManager
 from tqdm import tqdm
-from typing_extensions import assert_never
 
 
 def similarity_from_cameras(c2w, strict_scaling=False, center_method="focus"):
@@ -195,12 +194,10 @@ class Parser:
         data_dir: str,
         factor: int = 1,
         normalize: bool = False,
-        test_every: int = 8,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
-        self.test_every = test_every
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -465,8 +462,6 @@ class Parser:
                 K_undist[0, 2] -= x_min
                 K_undist[1, 2] -= y_min
                 roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min]
-            else:
-                assert_never(camtype)
 
             self.mapx_dict[camera_id] = mapx
             self.mapy_dict[camera_id] = mapy
@@ -490,19 +485,32 @@ class Dataset:
         parser: Parser,
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        override_imgs = None,
     ):
         self.parser = parser
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
         self.indices = indices
+        self.override_imgs = override_imgs
+        self.preloaded_imgs = False
+        self.data = []
+        if len(self.indices) < 50:
+            for i in self.indices:
+                self.data.append(self.__getitem__(i))
+            self.preloaded_imgs = True
 
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        if self.preloaded_imgs:
+            return self.data[index]
+        if self.override_imgs:
+            image = self.override_imgs[index]
+        else:
+            image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
@@ -575,7 +583,7 @@ if __name__ == "__main__":
 
     # Parse COLMAP data.
     parser = Parser(
-        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
+        data_dir=args.data_dir, factor=args.factor, normalize=True
     )
     dataset = Dataset(parser, load_depths=True)
     print(f"Dataset: {len(dataset)} images.")

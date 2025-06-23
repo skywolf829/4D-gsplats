@@ -9,6 +9,8 @@ import pycolmap
 import numpy as np
 import trimesh
 import copy
+import imageio.v3 as iio
+from pathlib import Path
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -112,7 +114,7 @@ def randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
     # restore original shape
     return limited_flat_mask.reshape(mask.shape)
     
-def model_inference(model, images, resolution=518):
+def model_inference(model, images, resolution=518, output_dir : Path | None = None):
     # images: [B, 3, H, W]
 
     assert len(images.shape) == 4
@@ -138,6 +140,19 @@ def model_inference(model, images, resolution=518):
     depth_map = depth_map.squeeze(0).cpu().numpy()
     depth_conf = depth_conf.squeeze(0).cpu().numpy()
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+    if output_dir:
+        depth_conf_path = output_dir / "depth_conf"
+        depth_path = output_dir / "depth"
+        depth_conf_path.mkdir(parents=True, exist_ok=True)
+        depth_path.mkdir(parents=True, exist_ok=True)
+
+        for depth_i, depth_conf_i, i in zip(depth_map, depth_conf, range(depth_map.shape[0])):
+            this_depth = np.log(depth_conf_i)
+            this_depth = np.clip(this_depth, 0, 1)
+            this_depth = (this_depth * 255).astype(np.uint8)
+            iio.imwrite(depth_conf_path / f"frame_{i:04d}.png", this_depth)
+            np.save(depth_path / f"frame_{i:04d}.np", depth_i)
+
     return extrinsic, intrinsic, depth_map, depth_conf, points_3d
 
 def bundle_adjustment(image_paths, original_coords, points_3d, extrinsic, intrinsic, 

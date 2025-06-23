@@ -1,13 +1,11 @@
-import json
 import math
+from ntpath import exists
 import os
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union, List, Any
 import random
-import imageio
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,20 +14,21 @@ import yaml
 from fused_ssim import fused_ssim
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
-from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
+from gsplat.strategy.ops import reset_opa
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from sklearn.neighbors import NearestNeighbors
-from dynamic_gsplats.file_ops import CameraImageDataset
 from dynamic_gsplats.colmap_dataset import Dataset, Parser
+import re
+
 
 def rotation_6d_to_matrix(d6: Tensor) -> Tensor:
     """
@@ -173,6 +172,63 @@ def set_random_seed(seed: int):
     torch.manual_seed(seed)
 
 @dataclass
+class DefaultStrategyNoOpaReset(DefaultStrategy):
+
+    refine_every: int = 5000
+    reset_every: int = 7500
+
+    def step_post_backward(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        step: int,
+        info: Dict[str, Any],
+        packed: bool = False,
+    ):
+        """Callback function to be executed after the `loss.backward()` call."""
+        if step >= self.refine_stop_iter:
+            return
+
+        self._update_state(params, state, info, packed=packed)
+
+        if (
+            step > self.refine_start_iter
+            and step % self.refine_every == 0
+            and step % self.reset_every >= self.pause_refine_after_reset
+        ):
+            # grow GSs
+            n_dupli, n_split = self._grow_gs(params, optimizers, state, step)
+            if self.verbose:
+                print(
+                    f"Step {step}: {n_dupli} GSs duplicated, {n_split} GSs split. "
+                    f"Now having {len(params['means'])} GSs."
+                )
+
+            # prune GSs
+            n_prune = self._prune_gs(params, optimizers, state, step)
+            if self.verbose:
+                print(
+                    f"Step {step}: {n_prune} GSs pruned. "
+                    f"Now having {len(params['means'])} GSs."
+                )
+
+            # reset running stats
+            state["grad2d"].zero_()
+            state["count"].zero_()
+            if self.refine_scale2d_stop_iter > 0:
+                state["radii"].zero_()
+            torch.cuda.empty_cache()
+
+        if step > 0 and step % self.reset_every == 0:
+            reset_opa(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                value=self.prune_opa * 2.0,
+            )
+
+@dataclass
 class Config:
    
     # Directory to save results
@@ -209,7 +265,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, DefaultStrategyNoOpaReset] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -243,7 +299,7 @@ class Config:
     scale_reg: float = 0.0
 
     # Enable camera optimization.
-    pose_opt: bool = False
+    pose_opt: bool = True
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -260,20 +316,16 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
-    # Enable bilateral grid. (experimental)
-    use_bilateral_grid: bool = False
-    # Shape of the bilateral grid (X, Y, W)
-    bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
-
     # Enable depth loss. (experimental)
-    depth_loss: bool = False
+    depth_loss: bool = True
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
     # Dump information to tensorboard every this steps
-    tb_every: int = 100
+    tb_every: int = 25
     # Save training images to tensorboard
-    tb_save_image: bool = False
+    tb_save_image: bool = True
+    tb_save_image_every: int = 250
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
@@ -286,7 +338,7 @@ class Config:
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
-        if isinstance(strategy, DefaultStrategy):
+        if isinstance(strategy, DefaultStrategy) or isinstance(strategy, DefaultStrategyNoOpaReset):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.reset_every = int(strategy.reset_every * factor)
@@ -318,45 +370,60 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    startings_splats = None,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
 
-    points = torch.from_numpy(parser.points).float()
-    rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
-
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
-        ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
-        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
-    ]
-
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+    if startings_splats:
+        params = [
+            ("means", torch.nn.Parameter(startings_splats['means']), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(startings_splats['scales']), scales_lr),
+            ("quats", torch.nn.Parameter(startings_splats['quats']), quats_lr),
+            ("opacities", torch.nn.Parameter(startings_splats['opacities']), opacities_lr),
+        ]
+        if feature_dim is None:
+            params.append(("sh0", torch.nn.Parameter(startings_splats['sh0']), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(startings_splats['shN']), shN_lr))
+        else:
+            params.append(("features", torch.nn.Parameter(startings_splats['features']), sh0_lr))
+            params.append(("colors", torch.nn.Parameter(startings_splats['colors']), sh0_lr))
     else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+        points = torch.from_numpy(parser.points).float()
+        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        scales = scales[world_rank::world_size]
+
+        N = points.shape[0]
+        quats = torch.rand((N, 4))  # [N, 4]
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
+
+        if feature_dim is None:
+            # color is SH coefficients.
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = rgb_to_sh(rgbs)   
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        else:
+            # features will be used for appearance and view-dependent shading
+            features = torch.rand(N, feature_dim)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(rgbs)  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -387,7 +454,7 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(
-        self, cfg: Config, local_rank: int = 0, world_rank: int = 0, world_size: int = 1
+        self, cfg: Config, local_rank: int = 0, world_rank: int = 0, world_size: int = 1, frame_no = 0, new_images = None, starting_splats = None
     ) -> None:
         set_random_seed(42 + local_rank)
 
@@ -396,6 +463,7 @@ class Runner:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
+        self.frame_no = frame_no
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -411,18 +479,18 @@ class Runner:
         os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb/{frame_no}")
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.result_dir,
-            normalize=False,
-            test_every=8,
+            normalize=False
         )
         self.trainset = Dataset(
             self.parser,
             patch_size=None,
-            load_depths=False,
+            load_depths=cfg.depth_loss,
+            override_imgs=new_images
         )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -448,13 +516,14 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            startings_splats=starting_splats
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy):
+        if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, DefaultStrategyNoOpaReset):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -576,7 +645,7 @@ class Runner:
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
+                if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, DefaultStrategyNoOpaReset)
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
@@ -595,7 +664,6 @@ class Runner:
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
 
         # Dump cfg.
         if world_rank == 0:
@@ -719,9 +787,6 @@ class Runner:
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
-            if cfg.use_bilateral_grid:
-                tvloss = 10 * total_variation_loss(self.bil_grids.grids)
-                loss += tvloss
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -748,13 +813,7 @@ class Runner:
             pbar.set_description(desc)
 
             # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
+            # 
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -765,12 +824,9 @@ class Runner:
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
-                if cfg.use_bilateral_grid:
-                    self.writer.add_scalar("train/tvloss", tvloss.item(), step)
-                if cfg.tb_save_image:
-                    canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-                    canvas = canvas.reshape(-1, *canvas.shape[2:])
-                    self.writer.add_image("train/render", canvas, step)
+                if cfg.tb_save_image and world_rank == 0 and step % cfg.tb_save_image_every == 0:
+                    canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy().squeeze()
+                    self.writer.add_image("train/render", canvas, step, dataformats="HWC")
                 self.writer.flush()
 
             
@@ -819,7 +875,7 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
+            if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, DefaultStrategyNoOpaReset):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -868,14 +924,45 @@ class Runner:
             sh0=sh0,
             shN=shN,
             format="ply",
-            save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
+            save_to=f"{self.ply_dir}/frame_{self.frame_no:04d}.ply",
+        )
+        torch.save(
+            self.splats, f"{self.ckpt_dir}/frame_{self.frame_no:04d}_step_{step:05d}.pt"
         )
 
+def find_latest_checkpoint(ckpt_dir):
+    ckpt_dir = Path(ckpt_dir)
+    pattern = re.compile(r"frame_(\d{4})_step_(\d{5})\.pt")
 
-def train_gsplat_from_colmap(
-    colmap_results_folder: str,
-):
-    config = Config(result_dir=colmap_results_folder)
+    latest = None
+    max_key = (-1, -1)
+
+    for file in ckpt_dir.glob("frame_????_step_?????.pt"):
+        match = pattern.match(file.name)
+        if match:
+            frame = int(match.group(1))
+            step = int(match.group(2))
+            if (frame, step) > max_key:
+                max_key = (frame, step)
+                latest = file
+
+    return latest, max_key
+
+def check_colmap_done(output_dir : Path) -> bool:
+    sub_items = ["cameras.bin", "images.bin", "points.ply", "points3D.bin"]
+    return output_dir.exists() and (output_dir / "sparse").exists() and all([(output_dir/"sparse"/sub_item).exists() for sub_item in sub_items])
+
+
+def train_gsplat_timestep_0(colmap_results_folder: str):
+    config = Config(result_dir=colmap_results_folder, depth_loss=False)
     config.adjust_steps(0.05)
-    runner = Runner(config)
+    runner = Runner(config,frame_no=0)
+    runner.train()
+
+def train_gsplat_timestep_n(colmap_results_folder: str, frame_no, new_images: List[np.ndarray], starting_splats):
+    config = Config(result_dir=colmap_results_folder, depth_loss=False,
+        strategy=DefaultStrategyNoOpaReset()
+        )
+    config.adjust_steps(0.05/3)
+    runner = Runner(config, frame_no=frame_no, new_images=new_images, starting_splats=starting_splats)
     runner.train()
