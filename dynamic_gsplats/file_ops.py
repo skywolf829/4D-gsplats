@@ -7,6 +7,18 @@ from pathlib import Path
 import torch
 from PIL import Image
 from torchvision import transforms as TF
+import subprocess
+import tempfile
+
+# ---- Global FFmpeg options ----
+FFMPEG_OVERWRITE = True  # Enable `-y`
+FFMPEG_QUIET = True      # Enable `-loglevel quiet`
+
+FFMPEG_FLAGS = []
+if FFMPEG_OVERWRITE:
+    FFMPEG_FLAGS.append("-y")
+if FFMPEG_QUIET:
+    FFMPEG_FLAGS.extend(["-loglevel", "quiet"])
 
 def load_video(video_path):
     vid = iio.imread(video_path)
@@ -16,8 +28,6 @@ def load_video(video_path):
 
 def load_image(image_path):
     img = iio.imread(image_path)
-    # convert to float32
-    img = img.astype(np.float32) / 255.0
     return img
 
 def load_images(image_paths):
@@ -151,6 +161,25 @@ def get_total_frames(video_path):
     cap.release()
     return total_frames
 
+def get_video_duration(video_path: Path) -> float:
+    result = subprocess.run([
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path)
+    ], stdout=subprocess.PIPE, text=True)
+    return float(result.stdout.strip())
+
+def find_shortest_duration_video(video_paths: list[Path]) -> tuple[Path, float]:
+    """Returns the (video_path, duration) of the shortest video."""
+    durations = [(v, get_video_duration(v)) for v in video_paths]
+    return min(durations, key=lambda x: x[1])
+
+def get_video_durations(video_paths: list[Path]) -> list[float]:
+    durations = [get_video_duration(v) for v in video_paths]
+    return durations
+
 def load_and_preprocess_images_square(image_path_list, target_size=None):
     """
     Load and preprocess images by center padding to square and resizing to target size.
@@ -245,3 +274,60 @@ def load_and_preprocess_images_square(image_path_list, target_size=None):
 
     return images, original_coords, target_size
 
+def extract_frame_at_time(video_path: str | Path, timestamp: float, output_path: str | Path | None = None) -> Path:
+    """Extract a frame from the video at a specific time (in seconds)."""
+    if output_path is None:
+        output_path = Path(tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name)
+    else:
+        output_path = Path(output_path)
+
+    subprocess.run([
+        "ffmpeg", *FFMPEG_FLAGS,
+        "-ss", f"{timestamp:.3f}",
+        "-i", str(video_path),
+        "-frames:v", "1",
+        str(output_path)
+    ], check=True)
+    assert output_path.exists(), f"Error extracting timestep {timestamp} from {video_path}"
+
+    return output_path
+
+def extract_frames_at_time(video_paths: list[Path], offsets: list[float], timestamp: float, output_folder : Path) -> list[Path]:
+    output_folder.mkdir(parents=True, exist_ok=True)
+    output_paths = [extract_frame_at_time(video_path, timestamp - offset, 
+        output_folder / f"{video_path.name}_{timestamp:0.02f}.png") for video_path, offset in zip(video_paths, offsets)]
+    return output_paths
+
+def find_videos(videos_path: Path, extensions=(".mp4", ".mov", ".MP4", ".MOV")) -> list[Path]:
+    video_paths = []
+    for ext in extensions:
+        video_paths.extend(Path(videos_path).glob(f"*{ext}"))
+    return sorted(video_paths)
+
+def get_video_resolution(video_path: Path) -> tuple[int, int]:
+    """Returns (width, height) of the video using OpenCV."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+    
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return width, height
+
+def get_rotation_metadata(video_path: Path) -> int:
+    """Returns rotation metadata in degrees (0, 90, 180, 270), or 0 if missing."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream_tags=rotate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path)
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    output = result.stdout.strip()
+    return int(output) if output.isdigit() else 0

@@ -12,6 +12,7 @@ import copy
 import imageio.v3 as iio
 from pathlib import Path
 
+VGGT_FIXED_RESOLUTION = 518
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
@@ -156,11 +157,11 @@ def model_inference(model, images, resolution=518, output_dir : Path | None = No
     return extrinsic, intrinsic, depth_map, depth_conf, points_3d
 
 def bundle_adjustment(image_paths, original_coords, points_3d, extrinsic, intrinsic, 
-    depth_conf, images, img_load_resolution, vggt_fixed_resolution, save_dir, use_ba=False):
+    depth_conf, images, img_load_resolution, save_dir, use_ba=False):
 
     if use_ba:
         image_size = np.array(images.shape[-2:])
-        scale = img_load_resolution / vggt_fixed_resolution
+        scale = img_load_resolution / VGGT_FIXED_RESOLUTION
         shared_camera = False
 
         with torch.autocast(device_type=DEVICE, dtype=DTYPE):
@@ -213,11 +214,11 @@ def bundle_adjustment(image_paths, original_coords, points_3d, extrinsic, intrin
         shared_camera = False  # in the feedforward manner, we do not support shared camera
         camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
 
-        image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
+        image_size = np.array([VGGT_FIXED_RESOLUTION, VGGT_FIXED_RESOLUTION])
         num_frames, height, width, _ = points_3d.shape
 
         points_rgb = F.interpolate(
-            images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
+            images, size=(VGGT_FIXED_RESOLUTION, VGGT_FIXED_RESOLUTION), mode="bilinear", align_corners=False
         )
         points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
         points_rgb = points_rgb.transpose(0, 2, 3, 1)
@@ -245,7 +246,7 @@ def bundle_adjustment(image_paths, original_coords, points_3d, extrinsic, intrin
             camera_type=camera_type,
         )
 
-        reconstruction_resolution = vggt_fixed_resolution
+        reconstruction_resolution = VGGT_FIXED_RESOLUTION
 
     reconstruction = rename_colmap_recons_and_rescale_camera(
         reconstruction,

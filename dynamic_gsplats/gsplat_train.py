@@ -233,6 +233,7 @@ class Config:
    
     # Directory to save results
     result_dir: str = "results"
+    img_folder: str = "images"
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Camera model
@@ -454,7 +455,7 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(
-        self, cfg: Config, local_rank: int = 0, world_rank: int = 0, world_size: int = 1, frame_no = 0, new_images = None, starting_splats = None
+        self, cfg: Config, local_rank: int = 0, world_rank: int = 0, world_size: int = 1, timestep = 0.0, new_images = None, starting_splats = None
     ) -> None:
         set_random_seed(42 + local_rank)
 
@@ -463,7 +464,7 @@ class Runner:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
-        self.frame_no = frame_no
+        self.timestep = timestep
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -479,11 +480,12 @@ class Runner:
         os.makedirs(self.ply_dir, exist_ok=True)
 
         # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb/{frame_no}")
+        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb/{timestep:0.02f}")
 
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.result_dir,
+            img_folder=cfg.img_folder,
             normalize=False
         )
         self.trainset = Dataset(
@@ -924,23 +926,24 @@ class Runner:
             sh0=sh0,
             shN=shN,
             format="ply",
-            save_to=f"{self.ply_dir}/frame_{self.frame_no:04d}.ply",
+            save_to=f"{self.ply_dir}/frame_{self.timestep:0.02f}.ply",
         )
         torch.save(
-            self.splats, f"{self.ckpt_dir}/frame_{self.frame_no:04d}_step_{step:05d}.pt"
+            self.splats, f"{self.ckpt_dir}/frame_{self.timestep:0.02f}_step_{step:05d}.pt"
         )
 
-def find_latest_checkpoint(ckpt_dir):
+def find_latest_checkpoint(ckpt_dir: str | Path) -> Tuple[Optional[Path], Tuple[float, int]]:
     ckpt_dir = Path(ckpt_dir)
-    pattern = re.compile(r"frame_(\d{4})_step_(\d{5})\.pt")
+    # Match: frame_12.34_step_00010.pt
+    pattern = re.compile(r"frame_(\d+\.\d{2})_step_(\d{5})\.pt")
 
     latest = None
-    max_key = (-1, -1)
+    max_key = (-1.0, -1)
 
-    for file in ckpt_dir.glob("frame_????_step_?????.pt"):
+    for file in ckpt_dir.glob("frame_*.pt"):
         match = pattern.match(file.name)
         if match:
-            frame = int(match.group(1))
+            frame = float(match.group(1))
             step = int(match.group(2))
             if (frame, step) > max_key:
                 max_key = (frame, step)
@@ -952,17 +955,19 @@ def check_colmap_done(output_dir : Path) -> bool:
     sub_items = ["cameras.bin", "images.bin", "points.ply", "points3D.bin"]
     return output_dir.exists() and (output_dir / "sparse").exists() and all([(output_dir/"sparse"/sub_item).exists() for sub_item in sub_items])
 
-
-def train_gsplat_timestep_0(colmap_results_folder: str):
-    config = Config(result_dir=colmap_results_folder, depth_loss=False)
+def train_gsplat_timestep_0(colmap_results_folder: str, img_folder:str):
+    config = Config(result_dir=colmap_results_folder, img_folder = img_folder, depth_loss=True)
     config.adjust_steps(0.05)
-    runner = Runner(config,frame_no=0)
+    runner = Runner(config,timestep=0.0)
     runner.train()
 
-def train_gsplat_timestep_n(colmap_results_folder: str, frame_no, new_images: List[np.ndarray], starting_splats):
-    config = Config(result_dir=colmap_results_folder, depth_loss=False,
+def train_gsplat_timestep_n(colmap_results_folder: str, img_folder: str, timestep:float, new_images: List[np.ndarray], starting_splats):
+    config = Config(
+        result_dir=colmap_results_folder, 
+        img_folder = img_folder,
+        depth_loss=False,
         strategy=DefaultStrategyNoOpaReset()
-        )
+    )
     config.adjust_steps(0.05/3)
-    runner = Runner(config, frame_no=frame_no, new_images=new_images, starting_splats=starting_splats)
+    runner = Runner(config, timestep=timestep, new_images=new_images, starting_splats=starting_splats)
     runner.train()

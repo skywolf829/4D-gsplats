@@ -1,25 +1,22 @@
 from pathlib import Path
-import glob
 import torch
-import numpy as np
-from file_ops import extract_single_frame_save_to_disc, load_and_preprocess_images_square, extract_frames_parallel, get_total_frames
+from file_ops import (
+    load_and_preprocess_images_square, 
+    extract_frames_at_time, load_images,
+    find_videos, get_video_durations
+)
 from scene_init import init_model, model_inference, bundle_adjustment
-from scene_init import DEVICE, DTYPE
+from scene_init import DEVICE
 from gsplat_train import check_colmap_done, train_gsplat_timestep_0, find_latest_checkpoint, train_gsplat_timestep_n
 import hashlib
-import imageio.v3 as iio
+from video_sync import sync_videos_get_offset, compute_synced_time_range
 
-vggt_fixed_resolution = 518
-
-def preprocessing(all_video_paths, output_dir):
+def preprocessing(all_video_paths : list[Path], offsets, output_dir, img_folder:str):
 
     print("Preprocessing videos")
-    img_dir = Path(output_dir / "images")
+    img_dir = Path(output_dir / img_folder)
     img_dir.mkdir(parents=True, exist_ok=True)
-    img_paths = []
-    for video in all_video_paths:
-        img_path = extract_single_frame_save_to_disc(Path(video), 0, img_dir)
-        img_paths.append(img_path)
+    img_paths = extract_frames_at_time(all_video_paths, offsets, 0.0, img_dir)
 
     images, original_coords, img_load_resolution = load_and_preprocess_images_square(img_paths)
     images = images.to(DEVICE)
@@ -38,45 +35,55 @@ def ts0_preprocess(img_paths, images, original_coords, img_load_resolution, outp
 
     print("Running bundle adjustment...")
     bundle_adjustment(img_paths, original_coords, points_3d, extrinsic, intrinsic, depth_conf, 
-        images, img_load_resolution, vggt_fixed_resolution, output_dir)
+        images, img_load_resolution, output_dir)
 
 def main():
-    videos_path = Path(__file__).parent.parent / "examples" / "time_varying" / "cut_roasted_beef"
-    all_video_paths = sorted(glob.glob(str(videos_path / "*.mp4")))
+    videos_path = Path(__file__).parent.parent / "examples" / "time_varying" / "sky_livingroom"
+    all_video_paths = find_videos(videos_path)
     output_dir = Path(__file__).parent.parent / "output" / hashlib.md5(str(videos_path).encode()).hexdigest()
     output_dir.mkdir(parents=True, exist_ok=True)
-    total_frames = get_total_frames(all_video_paths[0])
     
+    # sync videos first
+    durations = get_video_durations(all_video_paths)
+    print(f"Video durations: {durations}")
+    offsets = sync_videos_get_offset([Path(p) for p in all_video_paths])
+    print(f"Video offsets: {offsets}")
 
-    start_frame = 0
-    frame_skip = 10
+    
+    time_start, time_end = compute_synced_time_range(offsets, durations)
+    time_end = time_end - 0.1 # some epsilon for vid issues
+    timestep = time_start
+    fps = 1
 
     latest_checkpoint, max_key = find_latest_checkpoint(output_dir / "ckpts")
     if latest_checkpoint:
-        start_frame = max_key[0]+frame_skip
+        timestep = max_key[0]+(1./fps)
     
-    for frame in range(start_frame, total_frames, frame_skip):
-        if frame == 0:
+    while timestep < time_end:
+        print(f"Timestep: {timestep} / {time_end}")
+        img_folder = f"synced_frames_{timestep:0.02f}"
+        if timestep == 0.0:
             # Check if colmap already ran
             if not check_colmap_done(output_dir):
                 # Get first frame stuff for the 
-                img_paths, original_coords, images, img_load_resolution = preprocessing(all_video_paths, output_dir)
+                img_paths, original_coords, images, img_load_resolution = preprocessing(all_video_paths, offsets, output_dir, img_folder)
                 # Run first frame posing
                 ts0_preprocess(img_paths, images, original_coords, img_load_resolution, output_dir)
 
             # train first timestep
-            train_gsplat_timestep_0(str(output_dir))
+            train_gsplat_timestep_0(str(output_dir), img_folder)
         else:
             latest_checkpoint, max_key = find_latest_checkpoint(output_dir / "ckpts")
-            print(f"Continuing from {latest_checkpoint}")
-            previous_splats = torch.load(latest_checkpoint, map_location="cuda", weights_only=False)
-            new_images = extract_frames_parallel(all_video_paths, frame)
-            # i = 0
-            # for im in new_images:
-            #     iio.imwrite(output_dir / "images" / f"cam{i:02d}_frame_{frame:06d}.png", im)
-            #     i += 1
-            train_gsplat_timestep_n(str(output_dir), frame_no=frame, new_images = new_images, starting_splats=previous_splats)
-        
+            if latest_checkpoint is not None:
+                print(f"Continuing from {latest_checkpoint}")
+                previous_splats = torch.load(latest_checkpoint, map_location="cuda", weights_only=False)                
+                new_images_paths = extract_frames_at_time(all_video_paths, offsets, timestep, output_dir / img_folder)
+                new_images = load_images(new_images_paths)
+                train_gsplat_timestep_n(str(output_dir), img_folder, timestep=timestep, new_images = new_images, starting_splats=previous_splats)
+            else:
+                print(f"Error: expected a latest checkpoint but found none")
+                quit()
+        timestep += (1/fps)
 
 if __name__ == "__main__":
     main()
