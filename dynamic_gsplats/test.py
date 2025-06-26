@@ -5,16 +5,14 @@ from file_ops import (
     extract_frames_at_time, load_images,
     find_videos, get_video_durations
 )
-from scene_init import init_model, model_inference, bundle_adjustment
-from scene_init import DEVICE
+from video_sync import sync_videos_get_offset, compute_synced_time_range
+from scene_init import DEVICE, init_model, model_inference, bundle_adjustment, undistort_colmap_model
 from gsplat_train import check_colmap_done, train_gsplat_timestep_0, find_latest_checkpoint, train_gsplat_timestep_n
 import hashlib
-from video_sync import sync_videos_get_offset, compute_synced_time_range
 
-def preprocessing(all_video_paths : list[Path], offsets, output_dir, img_folder:str):
+def preprocessing(all_video_paths : list[Path], offsets, output_dir, img_dir:Path):
 
     print("Preprocessing videos")
-    img_dir = Path(output_dir / img_folder)
     img_dir.mkdir(parents=True, exist_ok=True)
     img_paths = extract_frames_at_time(all_video_paths, offsets, 0.0, img_dir)
 
@@ -61,17 +59,21 @@ def main():
     
     while timestep < time_end:
         print(f"Timestep: {timestep} / {time_end}")
-        img_folder = f"synced_frames_{timestep:0.02f}"
+        img_folder = output_dir / "sparse" / f"synced_frames_{timestep:0.02f}"
+        undistorted_dir = output_dir / "sparse" / f"undistorted_{timestep:0.02f}"
         if timestep == 0.0:
             # Check if colmap already ran
             if not check_colmap_done(output_dir):
                 # Get first frame stuff for the 
                 img_paths, original_coords, images, img_load_resolution = preprocessing(all_video_paths, offsets, output_dir, img_folder)
                 # Run first frame posing
-                ts0_preprocess(img_paths, images, original_coords, img_load_resolution, output_dir)
-
+                ts0_preprocess(img_paths, images, original_coords, 
+                    img_load_resolution, output_dir)
+            
+            print("Undistorting images")
+            undistort_colmap_model(output_dir/"sparse", img_folder, undistorted_dir)
             # train first timestep
-            train_gsplat_timestep_0(str(output_dir), img_folder)
+            train_gsplat_timestep_0(str(output_dir), str(img_folder.relative_to(output_dir)))
         else:
             latest_checkpoint, max_key = find_latest_checkpoint(output_dir / "ckpts")
             if latest_checkpoint is not None:
@@ -79,7 +81,8 @@ def main():
                 previous_splats = torch.load(latest_checkpoint, map_location="cuda", weights_only=False)                
                 new_images_paths = extract_frames_at_time(all_video_paths, offsets, timestep, output_dir / img_folder)
                 new_images = load_images(new_images_paths)
-                train_gsplat_timestep_n(str(output_dir), img_folder, timestep=timestep, new_images = new_images, starting_splats=previous_splats)
+                train_gsplat_timestep_n(str(output_dir), str(img_folder.relative_to(output_dir)),
+                    timestep=timestep, new_images = new_images, starting_splats=previous_splats)
             else:
                 print(f"Error: expected a latest checkpoint but found none")
                 quit()

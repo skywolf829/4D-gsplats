@@ -250,7 +250,7 @@ class Config:
     save_ply: bool = True
 
     # Degree of spherical harmonics
-    sh_degree: int = 0
+    sh_degree: int = 3
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -956,7 +956,11 @@ def check_colmap_done(output_dir : Path) -> bool:
     return output_dir.exists() and (output_dir / "sparse").exists() and all([(output_dir/"sparse"/sub_item).exists() for sub_item in sub_items])
 
 def train_gsplat_timestep_0(colmap_results_folder: str, img_folder:str):
-    config = Config(result_dir=colmap_results_folder, img_folder = img_folder, depth_loss=True)
+    config = Config(result_dir=colmap_results_folder, 
+        img_folder=img_folder, 
+        depth_loss=False,
+        pose_opt=False,
+        )
     config.adjust_steps(0.05)
     runner = Runner(config,timestep=0.0)
     runner.train()
@@ -964,9 +968,10 @@ def train_gsplat_timestep_0(colmap_results_folder: str, img_folder:str):
 def train_gsplat_timestep_n(colmap_results_folder: str, img_folder: str, timestep:float, new_images: List[np.ndarray], starting_splats):
     config = Config(
         result_dir=colmap_results_folder, 
-        img_folder = img_folder,
+        img_folder=img_folder,
+        strategy=DefaultStrategyNoOpaReset(),
         depth_loss=False,
-        strategy=DefaultStrategyNoOpaReset()
+        pose_opt=False,
     )
     config.adjust_steps(0.05/3)
     runner = Runner(config, timestep=timestep, new_images=new_images, starting_splats=starting_splats)

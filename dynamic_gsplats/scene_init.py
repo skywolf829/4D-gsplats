@@ -11,6 +11,7 @@ import trimesh
 import copy
 import imageio.v3 as iio
 from pathlib import Path
+import shutil
 
 VGGT_FIXED_RESOLUTION = 518
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -27,7 +28,7 @@ def rename_colmap_recons_and_rescale_camera(
         # Rename the images to the original names
         pyimage = reconstruction.images[pyimageid]
         pycamera = reconstruction.cameras[pyimage.camera_id]
-        pyimage.name = image_paths[pyimageid - 1]
+        pyimage.name = image_paths[pyimageid - 1].name
 
         if rescale_camera:
             # Rescale the camera parameters
@@ -115,7 +116,7 @@ def randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
     # restore original shape
     return limited_flat_mask.reshape(mask.shape)
     
-def model_inference(model, images, resolution=518, output_dir : Path | None = None):
+def model_inference(model : VGGT, images, resolution=518, output_dir : Path | None = None):
     # images: [B, 3, H, W]
 
     assert len(images.shape) == 4
@@ -128,9 +129,9 @@ def model_inference(model, images, resolution=518, output_dir : Path | None = No
         with torch.autocast(device_type=DEVICE, dtype=DTYPE):
             images = images[None]  # add batch dimension
             aggregated_tokens_list, ps_idx = model.aggregator(images)
-
         # Predict Cameras
-        pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+        vggt_values = model.camera_head(aggregated_tokens_list)
+        pose_enc = vggt_values[-1]
         # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
         extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
         # Predict Depth Maps
@@ -266,3 +267,16 @@ def bundle_adjustment(image_paths, original_coords, points_3d, extrinsic, intrin
     trimesh.PointCloud(points_3d, colors=points_rgb).export(save_dir / "sparse/points.ply")
 
     return True
+
+def undistort_colmap_model(
+    model_path: Path,
+    image_path: Path,
+    output_path: Path,):
+
+    shutil.rmtree(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+    pycolmap.undistort_images(
+        input_path=str(model_path),
+        image_path=str(image_path),
+        output_path=str(output_path),
+    )
